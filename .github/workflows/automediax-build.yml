@@ -1,0 +1,101 @@
+name: AutoMediaX - Android Auto APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: automediax-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-apk:
+    name: Build and verify Android Auto APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      NO_GS: 'true'
+      ANDROID_USER_HOME: ${{ github.workspace }}/.android
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: >-
+            platform-tools
+            platforms;android-36
+            build-tools;36.0.0
+            ndk;29.0.14206865
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Prepare build
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          mkdir -p "$ANDROID_USER_HOME" dist
+          test -f gradle/libs.versions.toml
+          test -f fermata/build.gradle
+          ./gradlew --version
+
+      - name: Build Android Auto universal APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./gradlew verifyWebOnlyProductionGraph :fermata:packageAutoDebugUniversalApk --stacktrace --console=plain --no-daemon
+
+      - name: Find, name and verify APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -d '' apks < <(find fermata/build/outputs/apk_from_bundle/autoDebug -type f -name '*-universal.apk' -print0)
+          if [ "${#apks[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one universal APK; found ${#apks[@]}"
+            find fermata/build/outputs -type f -name '*.apk' -print || true
+            exit 1
+          fi
+          VERSION="$(sed -n 's/^appVersionName = "\([^"]*\)"/\1/p' gradle/libs.versions.toml | head -1)"
+          test -n "$VERSION"
+          DEST="dist/AutoMediaX-${VERSION}-AndroidAuto.apk"
+          cp "${apks[0]}" "$DEST"
+          test -s "$DEST"
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs "$DEST" | tee dist/signature.txt
+          "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$DEST" | head -15 | tee dist/apk-info.txt
+          python3 scripts/verify_security_apk.py "$DEST" --aapt "$ANDROID_HOME/build-tools/36.0.0/aapt" --output dist/security-check.json
+          (cd dist && sha256sum *.apk > SHA256SUMS.txt)
+          echo "APK_PATH=$DEST" >> "$GITHUB_ENV"
+
+      - name: Upload downloadable APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoMediaX-AndroidAuto-APK
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Build summary
+        if: success()
+        shell: bash
+        run: |
+          echo '## AutoMediaX APK ready' >> "$GITHUB_STEP_SUMMARY"
+          echo "- APK: \`$(basename "$APK_PATH")\`" >> "$GITHUB_STEP_SUMMARY"
+          echo '- Download from **Actions → this run → Artifacts**.' >> "$GITHUB_STEP_SUMMARY"
+          echo '- Signed as a debug build; an existing app signed with a different key may need uninstalling first.' >> "$GITHUB_STEP_SUMMARY"
